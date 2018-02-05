@@ -12,6 +12,12 @@ module Network.HTTP.Types.URI
 , renderSimpleQuery
 , parseQuery
 , parseSimpleQuery
+  -- **Escape only parts
+, renderQueryPartialEscape
+, renderQueryBuilderPartialEscape
+, EscapeItem(..)
+, PartialEscapeQueryItem
+, PartialEscapeQuery
   -- ** Text query string (UTF8 encoded)
 , QueryText
 , queryTextToQuery
@@ -186,7 +192,11 @@ urlEncodeBuilder' extraUnreserved = mconcat . map encodeChar . B.unpack
                     | ch >= 48 && ch <= 57  = True -- 0-9
       unreserved c = c `elem` extraUnreserved
 
-      h2 v = B.word8 37 `mappend` B.word8HexFixed v -- percent (%)
+      -- must be upper-case
+      h2 v = B.word8 37 `mappend` B.word8 (h a) `mappend` B.word8 (h b) -- 37 = %
+          where (a, b) = v `divMod` 16
+      h i | i < 10    = 48 + i -- zero (0)
+          | otherwise = 65 + i - 10 -- 65: A
 
 -- | Percent-encoding for URLs (using 'B.Builder').
 urlEncodeBuilder
@@ -319,3 +329,51 @@ decodePath :: B.ByteString -> ([Text], Query)
 decodePath b =
     let (x, y) = B.break (== 63) b -- question mark
     in (decodePathSegments x, parseQuery y)
+
+-----------------------------------------------------------------------------------------
+
+-- | For some URIs characters must not be URI encoded,
+-- eg '+' or ':' in q=a+language:haskell+created:2009-01-01..2009-02-01&sort=stars
+-- The character list unreservedPI instead of unreservedQS would solve this.
+-- But we explicitly decide what part to encode.
+-- This is mandatory when searching for '+': q=%2B+language:haskell.
+data EscapeItem = QE B.ByteString -- will be URL encoded
+                | QN B.ByteString -- will not be url encoded, eg '+' or ':'
+    deriving (Show, Eq, Ord)
+
+-- | Query item
+type PartialEscapeQueryItem = (B.ByteString, [EscapeItem])
+
+-- | Query with some chars that should not be escaped.
+-- 
+-- General form: a=b&c=d:e+f&g=h
+type PartialEscapeQuery = [PartialEscapeQueryItem]
+
+-- | Convert 'PartialEscapeQuery' to 'ByteString'.
+renderQueryPartialEscape :: Bool -- ^ prepend question mark?
+            -> PartialEscapeQuery -> B.ByteString
+renderQueryPartialEscape qm = BL.toStrict . B.toLazyByteString . renderQueryBuilderPartialEscape qm
+
+-- | Convert 'PartialEscapeQuery' to a 'Builder'.
+renderQueryBuilderPartialEscape :: Bool -- ^ prepend a question mark?
+                   -> PartialEscapeQuery
+                   -> B.Builder
+renderQueryBuilderPartialEscape _ [] = mempty
+-- FIXME replace mconcat + map with foldr
+renderQueryBuilderPartialEscape qmark' (p:ps) = mconcat
+    $ go (if qmark' then qmark else mempty) p
+    : map (go amp) ps
+  where
+    qmark = B.byteString "?"
+    amp = B.byteString "&"
+    equal = B.byteString "="
+    go sep (k, mv) = mconcat [
+                      sep
+                     , urlEncodeBuilder True k
+                     , case mv of
+                         [] -> mempty
+                         vs -> equal `mappend` (mconcat (map encode vs))
+                     ]
+    encode (QE v) = urlEncodeBuilder True v
+    encode (QN v) = B.byteString v
+
